@@ -7,9 +7,10 @@ using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
+using Microsoft.AspNetCore.RateLimiting;
 using System.Text;
+using System.Threading.RateLimiting;
 using Serilog;
-using ChineseAuction.Middleware;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -49,8 +50,14 @@ builder.Services.AddSwaggerGen(options =>
     });
 });
 
+builder.Services.AddStackExchangeRedisCache(options =>
+{
+    options.Configuration = builder.Configuration.GetConnectionString("Redis") ?? "redis:6379,password=YourStrong@123,abortConnect=false";
+    options.InstanceName = builder.Configuration["Redis:InstanceName"] ?? "ChineseAuctionCache:";
+});
+
 builder.Services.AddDbContext<ChineseAuctionDbContext>(options =>
-        options.UseSqlServer("Server=(LocalDB)\\MSSQLLocalDB;DataBase=Chinese_Auction;Integrated Security=SSPI;Persist Security Info=False;TrustServerCertificate=True;"));
+        options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection") ?? "Server=(LocalDB)\\MSSQLLocalDB;DataBase=Chinese_Auction;Integrated Security=SSPI;PersistSecurity Info=False;TrustServerCertificate=True;"));
 
 //scoped for repositories
 builder.Services.AddScoped<ICategoryRepository, CategoryRepository>();
@@ -115,6 +122,38 @@ builder.Services.AddAuthentication(options =>
 
 builder.Services.AddAuthorization();
 
+builder.Services.AddRateLimiter(options =>
+{
+    options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(httpContext =>
+    {
+        var clientId = httpContext.Connection.RemoteIpAddress?.ToString() ?? "anonymous";
+        var permitLimit = builder.Configuration.GetValue<int>("RateLimiting:PermitLimit", 60);
+        var windowMinutes = builder.Configuration.GetValue<int>("RateLimiting:WindowMinutes", 1);
+        var segments = builder.Configuration.GetValue<int>("RateLimiting:SegmentsPerWindow", 4);
+
+        return RateLimitPartition.GetSlidingWindowLimiter(clientId, _ => new SlidingWindowRateLimiterOptions
+        {
+            PermitLimit = permitLimit,
+            Window = TimeSpan.FromMinutes(windowMinutes),
+            SegmentsPerWindow = segments,
+            QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+            QueueLimit = 0
+        });
+    });
+
+    options.RejectionStatusCode = 429;
+    options.AddPolicy("Default", context =>
+    {
+        return RateLimitPartition.GetFixedWindowLimiter("global", _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 1000,
+            Window = TimeSpan.FromMinutes(1),
+            QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+            QueueLimit = 0
+        });
+    });
+});
+
 Log.Logger = new LoggerConfiguration()
     .ReadFrom.Configuration(builder.Configuration)
     .CreateLogger();
@@ -142,7 +181,7 @@ var app = builder.Build();
 app.UseCors("AllowAngular");
 
 
-Log.Information("äàôìé÷öéä øöä!");
+Log.Information("ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½!");
 
 
 // Configure the HTTP request pipeline.
@@ -156,7 +195,7 @@ app.UseStaticFiles();
 app.UseHttpsRedirection();
 app.UseAuthentication();
 app.UseAuthorization();
-app.UseRateLimiting();
+app.UseRateLimiter();
 
 app.MapControllers();
 

@@ -2,7 +2,10 @@
 using Chinese_Auction.Dto_s;
 using Chinese_Auction.Models;
 using Chinese_Auction.Repository;
-using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Distributed;
+using Microsoft.Extensions.Configuration;
+using System.Linq;
+using System.Text.Json;
 
 namespace Chinese_Auction.Services
 {
@@ -11,18 +14,49 @@ namespace Chinese_Auction.Services
         private readonly IGiftRepository _giftRepository;
         private readonly IMapper _mapper;
         private readonly ILogger<GiftRepository> _logger;
+        private readonly IDistributedCache _cache;
+        private readonly TimeSpan _giftListCacheTtl;
+        private const string GiftListCacheKey = "GiftService:AllGifts";
 
-        public GiftService(IGiftRepository giftRepository, IMapper mapper, ILogger<GiftRepository> logger)
+        public GiftService(
+            IGiftRepository giftRepository,
+            IMapper mapper,
+            ILogger<GiftRepository> logger,
+            IDistributedCache cache,
+            IConfiguration configuration)
         {
             _giftRepository = giftRepository;
             _mapper = mapper;
             _logger = logger;
+            _cache = cache;
+            var ttlSeconds = configuration.GetValue<int?>("Redis:GiftListTTLSeconds") ?? 60;
+            _giftListCacheTtl = TimeSpan.FromSeconds(ttlSeconds);
         }
 
         public async Task<IEnumerable<GetGiftDto>> GetAllGiftsAsync()
         {
+            var cachedJson = await _cache.GetStringAsync(GiftListCacheKey);
+            if (!string.IsNullOrWhiteSpace(cachedJson))
+            {
+                _logger.LogInformation("Returning gifts from Redis cache.");
+                return JsonSerializer.Deserialize<IEnumerable<GetGiftDto>>(cachedJson) ?? Enumerable.Empty<GetGiftDto>();
+            }
+
             var gifts = await _giftRepository.GetAllGiftsAsync();
-            return _mapper.Map<IEnumerable<GetGiftDto>>(gifts);
+            var dto = _mapper.Map<IEnumerable<GetGiftDto>>(gifts);
+            var cacheOptions = new DistributedCacheEntryOptions
+            {
+                AbsoluteExpirationRelativeToNow = _giftListCacheTtl
+            };
+
+            await _cache.SetStringAsync(GiftListCacheKey, JsonSerializer.Serialize(dto), cacheOptions);
+            _logger.LogInformation("Stored gift list in Redis cache for {TtlSeconds} seconds.", _giftListCacheTtl.TotalSeconds);
+            return dto;
+        }
+
+        private Task InvalidateGiftListCacheAsync()
+        {
+            return _cache.RemoveAsync(GiftListCacheKey);
         }
 
         public async Task<GetGiftDto?> GetGiftByIdAsync(int id)
@@ -47,6 +81,7 @@ namespace Chinese_Auction.Services
         {
             var createGift = _mapper.Map<Gift>(gift);
             var addedGift = await _giftRepository.CreateGiftAsync(createGift);
+            await InvalidateGiftListCacheAsync();
             return _mapper.Map<GetGiftDto>(addedGift);
         }
 
@@ -68,6 +103,7 @@ namespace Chinese_Auction.Services
                 _logger.LogError($"Failed to update Gift with ID {id}.");
                 return null;
             }
+            await InvalidateGiftListCacheAsync();
             return _mapper.Map<GetGiftDto>(updatedGift);
         }
 
@@ -86,6 +122,7 @@ namespace Chinese_Auction.Services
                 _logger.LogError($"Failed to update purchase quantity for Gift with ID {id}.");
                 return null;
             }
+            await InvalidateGiftListCacheAsync();
             return _mapper.Map<UpdateGiftDto>(updatedGift);
         }
 
@@ -101,6 +138,7 @@ namespace Chinese_Auction.Services
             if (existingGift.Purchases.Any() || existingGift.Purchases.Count() > 0)
                 throw new InvalidOperationException("לא ניתן למחוק מתנה שכבר נבחרה להגרלה");
             await _giftRepository.DeleteGiftAsync(id);
+            await InvalidateGiftListCacheAsync();
             return true;
         }
 
